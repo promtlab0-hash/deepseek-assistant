@@ -21,10 +21,35 @@ import sys
 
 import requests
 
-ENDPOINT = "https://models.github.ai/inference/chat/completions"
-# Цепочка моделей: упёрся лимит/ошибка одной — берём следующую. Все умеют tools.
-MODELS = ["deepseek/deepseek-v3-0324", "openai/gpt-4o", "openai/gpt-4.1",
-          "openai/gpt-4o-mini"]
+# Провайдеры (OpenAI-совместимые). У каждого свой бесплатный лимит; ключ берётся
+# из перечисленных переменных окружения (github — из токена, см. load_token).
+PROVIDERS = {
+    "github":     {"base": "https://models.github.ai/inference", "keys": ["GITHUB_TOKEN", "LLM_API_KEY"]},
+    "groq":       {"base": "https://api.groq.com/openai/v1",      "keys": ["GROQ_API_KEY"]},
+    "openrouter": {"base": "https://openrouter.ai/api/v1",        "keys": ["OPENROUTER_API_KEY"]},
+    "gemini":     {"base": "https://generativelanguage.googleapis.com/v1beta/openai", "keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]},
+    "ollama":     {"base": "http://localhost:11434/v1",           "keys": []},
+}
+
+# Цепочка «сильнее → запаснее». Упёрся лимит/ошибка/нет ключа — берём следующую.
+# Все модели проверены на поддержку инструментов. У каждой GitHub-модели СВОЙ
+# суточный лимит, токен один — поэтому запас большой и бесплатный.
+CHAIN = [
+    ("github", "deepseek/deepseek-v3-0324"),
+    ("github", "openai/gpt-4o"),
+    ("github", "openai/gpt-4.1"),
+    ("github", "mistral-ai/mistral-medium-2505"),
+    ("github", "cohere/cohere-command-a"),
+    ("github", "meta/llama-3.3-70b-instruct"),
+    ("github", "openai/gpt-4.1-mini"),
+    ("github", "openai/gpt-4o-mini"),
+    # ↓ включатся автоматически, когда добавишь бесплатный ключ в .env
+    ("groq", "llama-3.3-70b-versatile"),
+    ("openrouter", "deepseek/deepseek-chat-v3-0324:free"),
+    ("gemini", "gemini-2.0-flash"),
+    # ↓ безлимитный локальный этаж, если установлен Ollama
+    ("ollama", "qwen2.5-coder:7b"),
+]
 MAX_TOOL_STEPS = 30          # предохранитель от зацикливания за один ответ
 MAX_FILE_BYTES = 200_000     # лимит чтения файла
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -200,30 +225,47 @@ def env_context() -> str:
     )
 
 
+def _provider_key(provider: str) -> str:
+    """Ключ провайдера из env; для github — пользовательский токен."""
+    for env_name in PROVIDERS[provider]["keys"]:
+        v = os.environ.get(env_name)
+        if v:
+            return v
+    if provider == "github":
+        return TOKEN
+    return ""
+
+
 def chat(messages: list[dict], tools: list[dict] | None, start_idx: int = 0):
-    """Запрос к GitHub Models, начиная с модели start_idx; при лимите/ошибке —
-    следующая. Возвращает (сообщение, индекс сработавшей модели)."""
+    """Идём по цепочке провайдеров/моделей с start_idx; при лимите/ошибке/без
+    ключа — следующая. Возвращает (сообщение, индекс сработавшей записи)."""
     last = ""
-    for idx in range(start_idx, len(MODELS)):
-        model = MODELS[idx]
+    for idx in range(start_idx, len(CHAIN)):
+        provider, model = CHAIN[idx]
+        key = _provider_key(provider)
+        if provider != "ollama" and not key:
+            continue  # нет ключа у провайдера — просто пропускаем
         payload: dict = {"model": model, "messages": messages, "temperature": 0.4}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         try:
-            r = requests.post(
-                ENDPOINT,
-                headers={"Authorization": f"Bearer {TOKEN}",
-                         "Content-Type": "application/json"},
-                json=payload, timeout=180,
-            )
+            r = requests.post(PROVIDERS[provider]["base"].rstrip("/") + "/chat/completions",
+                              headers=headers, json=payload, timeout=180)
         except requests.RequestException as e:
-            last = f"сеть: {e}"
+            last = f"{provider}: сеть {e}"
             continue
         if r.status_code == 200:
-            return r.json()["choices"][0]["message"], idx
+            try:
+                return r.json()["choices"][0]["message"], idx
+            except Exception:
+                last = f"{short(model)}: кривой ответ"
+                continue
         last = f"{short(model)} HTTP {r.status_code}"
-    raise RuntimeError(f"все модели недоступны ({last})")
+    raise RuntimeError(f"все модели в цепочке недоступны ({last})")
 
 
 # --------------------------------------------------------------------------- #
@@ -400,10 +442,10 @@ def agent_turn(messages: list[dict], state: dict) -> None:
         full = [{"role": "system", "content": sys_note}] + messages
         msg, idx = chat(full, tools_for(state["plan"]), state["mi"])
         state["mi"] = idx  # внутри хода держимся сработавшей модели
-        model = MODELS[idx]
+        model = CHAIN[idx][1]
         if model != state.get("active"):
             if state.get("active") is not None and idx > 0:
-                print(f"{C['y']}⚠ {short(MODELS[0])} занят (лимит) → перешёл на {short(model)}{C['x']}")
+                print(f"{C['y']}⚠ {short(CHAIN[0][1])} занят (лимит) → перешёл на {short(model)}{C['x']}")
             state["active"] = model
         messages.append(msg)
 
@@ -508,9 +550,10 @@ def main() -> int:
             print(f"авто-подтверждение: {'ВКЛ' if state['yolo'] else 'выкл'}"); continue
         if user == "/model":
             print("Цепочка моделей (по приоритету, авто-переключение при лимите):")
-            for i, m in enumerate(MODELS, 1):
+            for i, (prov, m) in enumerate(CHAIN, 1):
                 star = "  ← сейчас" if m == state["active"] else ""
-                print(f"  {i}. {m}{star}")
+                avail = "" if (prov == "ollama" or _provider_key(prov)) else "  (нужен ключ)"
+                print(f"  {i}. {short(m)} [{prov}]{avail}{star}")
             if not state["active"]:
                 print(f"{C['d']}(активная определится после первого ответа){C['x']}")
             continue
