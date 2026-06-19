@@ -57,10 +57,16 @@ TOKEN = ""  # заполняется в main()
 # --------------------------------------------------------------------------- #
 # Вызов модели с авто-переключением
 # --------------------------------------------------------------------------- #
-def chat(messages: list[dict], tools: list[dict] | None) -> dict:
-    """Запрос к GitHub Models; перебираем модели при лимите/ошибке."""
+def short(model: str) -> str:
+    return model.split("/")[-1]
+
+
+def chat(messages: list[dict], tools: list[dict] | None, start_idx: int = 0):
+    """Запрос к GitHub Models, начиная с модели start_idx; при лимите/ошибке —
+    следующая. Возвращает (сообщение, индекс сработавшей модели)."""
     last = ""
-    for model in MODELS:
+    for idx in range(start_idx, len(MODELS)):
+        model = MODELS[idx]
         payload: dict = {"model": model, "messages": messages, "temperature": 0.4}
         if tools:
             payload["tools"] = tools
@@ -76,14 +82,8 @@ def chat(messages: list[dict], tools: list[dict] | None) -> dict:
             last = f"сеть: {e}"
             continue
         if r.status_code == 200:
-            msg = r.json()["choices"][0]["message"]
-            if model != MODELS[0]:
-                print(f"{C['d']}(модель: {model}){C['x']}")
-            return msg
-        last = f"{model} HTTP {r.status_code}: {r.text[:160]}"
-        if r.status_code not in (429, 500, 503):
-            # не лимит — нет смысла пробовать другие, но всё же продолжим
-            pass
+            return r.json()["choices"][0]["message"], idx
+        last = f"{short(model)} HTTP {r.status_code}"
     raise RuntimeError(f"все модели недоступны ({last})")
 
 
@@ -201,7 +201,10 @@ def confirm(name: str, args: dict, state: dict) -> bool:
         return True
     preview = args.get("command") or f"{args.get('path','')}"
     print(f"{C['y']}  ⚙ {name}: {preview}{C['x']}")
-    ans = input(f"{C['y']}  Выполнить? [y/N/a=всегда] {C['x']}").strip().lower()
+    try:
+        ans = input(f"{C['y']}  Выполнить? [y/N/a=всегда] {C['x']}").strip().lower()
+    except EOFError:
+        return False
     if ans in ("a", "always", "всегда"):
         state["yolo"] = True
         return True
@@ -224,16 +227,24 @@ search), потом меняй. Не выдумывай содержимое ф�
 # Один ход диалога: гоняем модель + инструменты до финального ответа
 # --------------------------------------------------------------------------- #
 def agent_turn(messages: list[dict], state: dict) -> None:
+    state["mi"] = 0  # каждый новый запрос пробуем сильнейшую модель сначала
     for _ in range(MAX_TOOL_STEPS):
         sys_note = SYSTEM + ("\n\n[СЕЙЧАС ВКЛЮЧЁН PLAN MODE]" if state["plan"] else "")
         full = [{"role": "system", "content": sys_note}] + messages
-        msg = chat(full, tools_for(state["plan"]))
+        msg, idx = chat(full, tools_for(state["plan"]), state["mi"])
+        state["mi"] = idx  # внутри хода держимся сработавшей модели
+        model = MODELS[idx]
+        if model != state.get("active"):
+            if state.get("active") is not None and idx > 0:
+                print(f"{C['y']}⚠ {short(MODELS[0])} занят (лимит) → перешёл на {short(model)}{C['x']}")
+            state["active"] = model
         messages.append(msg)
 
         calls = msg.get("tool_calls")
         if not calls:
             content = msg.get("content") or "(пусто)"
-            print(f"\n{C['c']}{content}{C['x']}\n")
+            print(f"\n{C['c']}{content}{C['x']}")
+            print(f"{C['d']}— {short(model)}{C['x']}\n")
             return
 
         for call in calls:
@@ -248,8 +259,8 @@ def agent_turn(messages: list[dict], state: dict) -> None:
             elif name in MUTATING and not confirm(name, args, state):
                 result = "Отклонено пользователем."
             else:
-                short = args.get("command") or args.get("path") or args.get("pattern") or ""
-                print(f"{C['d']}  → {name} {short}{C['x']}")
+                preview = args.get("command") or args.get("path") or args.get("pattern") or ""
+                print(f"{C['d']}  → {name} {preview}{C['x']}")
                 try:
                     result = TOOLS_IMPL[name](**args)
                 except Exception as e:
@@ -266,6 +277,7 @@ HELP = f"""{C['b']}Команды:{C['x']}
   /plan    — включить PLAN MODE (только чтение + план, без изменений)
   /run     — выключить PLAN MODE (разрешить правки и команды)
   /yolo    — не спрашивать подтверждение на действия (вкл/выкл)
+  /model   — показать модели и какая отвечает сейчас
   /reset   — очистить историю диалога
   /help    — это сообщение
   /exit    — выход
@@ -275,7 +287,7 @@ HELP = f"""{C['b']}Команды:{C['x']}
 def main() -> int:
     global TOKEN
     TOKEN = load_token()
-    state = {"plan": False, "yolo": False}
+    state = {"plan": False, "yolo": False, "active": None, "mi": 0}
     messages: list[dict] = []
 
     print(f"{C['g']}{C['b']}DeepSeek-V3 ассистент{C['x']} "
@@ -284,8 +296,9 @@ def main() -> int:
 
     while True:
         mode = f"{C['y']}[PLAN]{C['x']} " if state["plan"] else ""
+        cur = f"{C['d']}[{short(state['active'])}]{C['x']} " if state["active"] else ""
         try:
-            user = input(f"{mode}{C['g']}ты ›{C['x']} ").strip()
+            user = input(f"{mode}{cur}{C['g']}ты ›{C['x']} ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nпока 👋")
             return 0
@@ -305,6 +318,14 @@ def main() -> int:
         if user == "/yolo":
             state["yolo"] = not state["yolo"]
             print(f"авто-подтверждение: {'ВКЛ' if state['yolo'] else 'выкл'}"); continue
+        if user == "/model":
+            print("Цепочка моделей (по приоритету, авто-переключение при лимите):")
+            for i, m in enumerate(MODELS, 1):
+                star = "  ← сейчас" if m == state["active"] else ""
+                print(f"  {i}. {m}{star}")
+            if not state["active"]:
+                print(f"{C['d']}(активная определится после первого ответа){C['x']}")
+            continue
         if user == "/reset":
             messages.clear(); print("история очищена."); continue
 
