@@ -11,11 +11,13 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import os
 import pathlib
 import platform
+import re
 import subprocess
 import sys
 
@@ -49,6 +51,13 @@ CHAIN = [
     ("gemini", "gemini-2.0-flash"),
     # ↓ безлимитный локальный этаж, если установлен Ollama
     ("ollama", "qwen2.5-coder:7b"),
+]
+# Модели, которые УМЕЮТ смотреть картинки (для инструмента view_image).
+VISION_CHAIN = [
+    ("github", "openai/gpt-4o"),
+    ("github", "openai/gpt-4.1"),
+    ("github", "openai/gpt-4o-mini"),
+    ("openrouter", "google/gemini-2.0-flash-exp:free"),
 ]
 MAX_TOOL_STEPS = 30          # предохранитель от зацикливания за один ответ
 MAX_FILE_BYTES = 200_000     # лимит чтения файла
@@ -268,6 +277,39 @@ def chat(messages: list[dict], tools: list[dict] | None, start_idx: int = 0):
     raise RuntimeError(f"все модели в цепочке недоступны ({last})")
 
 
+def chat_vision(image_url: str, question: str) -> str:
+    """Спросить vision-модель про картинку (image_url — http(s) или data:base64)."""
+    content = [
+        {"type": "text", "text": question or "Опиши подробно, что на изображении."},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]
+    messages = [{"role": "user", "content": content}]
+    last = ""
+    for provider, model in VISION_CHAIN:
+        key = _provider_key(provider)
+        if provider != "ollama" and not key:
+            continue
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            r = requests.post(PROVIDERS[provider]["base"].rstrip("/") + "/chat/completions",
+                              headers=headers,
+                              json={"model": model, "messages": messages, "temperature": 0.2},
+                              timeout=90)
+        except requests.RequestException as e:
+            last = f"{provider}: сеть {e}"
+            continue
+        if r.status_code == 200:
+            try:
+                return r.json()["choices"][0]["message"]["content"] or "(пустой ответ зрения)"
+            except Exception:
+                last = "кривой ответ"
+                continue
+        last = f"{short(model)} HTTP {r.status_code}"
+    return f"не удалось посмотреть изображение ({last})"
+
+
 # --------------------------------------------------------------------------- #
 # Инструменты (что агент умеет делать с ПК)
 # --------------------------------------------------------------------------- #
@@ -336,14 +378,154 @@ def t_remember(fact: str) -> str:
     return f"ЗАПОМНЕНО: {saved}" if saved else "пустой факт — не сохранил"
 
 
+_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+         ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+
+
+def t_view_image(source: str, question: str = "") -> str:
+    """Глаза: посмотреть картинку (локальный файл или http(s)-ссылка) и описать.
+
+    Картинку всегда кодируем в base64 и шлём инлайн (надёжнее, чем просить модель
+    самой скачать URL)."""
+    src = source.strip()
+    if src.lower().startswith(("http://", "https://")):
+        try:
+            r = requests.get(src, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            if r.status_code != 200:
+                return f"не скачать картинку (HTTP {r.status_code})"
+            raw = r.content
+            mime = r.headers.get("Content-Type", "").split(";")[0] or "image/jpeg"
+            if not mime.startswith("image/"):
+                mime = _MIME.get(pathlib.Path(src.split("?")[0]).suffix.lower(), "image/jpeg")
+        except Exception as e:
+            return f"ошибка загрузки картинки: {e}"
+    else:
+        p = pathlib.Path(src).expanduser()
+        if not p.exists():
+            return f"НЕТ ФАЙЛА: {source}"
+        raw = p.read_bytes()
+        mime = _MIME.get(p.suffix.lower(), "image/png")
+    b64 = base64.b64encode(raw).decode("ascii")
+    return chat_vision(f"data:{mime};base64,{b64}", question)
+
+
+def t_search_photos(query: str, count: int = 5) -> str:
+    """Поиск фото на бесплатном стоке Pexels (нужен бесплатный PEXELS_API_KEY)."""
+    key = os.environ.get("PEXELS_API_KEY")
+    if not key:
+        return ("нет PEXELS_API_KEY. Заведи бесплатный ключ на https://www.pexels.com/api/ "
+                "и добавь PEXELS_API_KEY=... в .env. (Анализ конкретной картинки/ссылки работает "
+                "и без ключа — через view_image.)")
+    try:
+        r = requests.get("https://api.pexels.com/v1/search",
+                         headers={"Authorization": key},
+                         params={"query": query, "per_page": max(1, min(int(count), 15))},
+                         timeout=30)
+        if r.status_code != 200:
+            return f"Pexels HTTP {r.status_code}: {r.text[:200]}"
+        photos = r.json().get("photos", [])
+    except Exception as e:
+        return f"ошибка Pexels: {e}"
+    if not photos:
+        return "ничего не найдено"
+    out = []
+    for p in photos:
+        out.append(f"- {p['src'].get('large') or p['src'].get('original')}  "
+                   f"(автор: {p.get('photographer','?')}; {p.get('alt','') or 'без описания'})")
+    return "Фото (ссылки можно открыть/скачать/посмотреть через view_image):\n" + "\n".join(out)
+
+
+def t_web_search(query: str) -> str:
+    """Веб-поиск без ключа (DuckDuckGo). Топ результатов: заголовок, ссылка, сниппет."""
+    try:
+        r = requests.post("https://html.duckduckgo.com/html/", data={"q": query},
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        html = r.text
+    except Exception as e:
+        return f"ошибка поиска: {e}"
+    items = re.findall(r'result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?result__snippet"[^>]*>(.*?)</a>',
+                       html, re.S)
+    if not items:
+        items = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S)
+        items = [(u, t, "") for u, t in items]
+    def clean(s: str) -> str:
+        s = re.sub(r"<[^>]+>", "", s)
+        return re.sub(r"\s+", " ", s).strip()
+    if not items:
+        return "ничего не найдено (или поиск временно недоступен)"
+    out = []
+    for u, t, sn in items[:6]:
+        link = re.sub(r"^.*?uddg=", "", u)
+        link = requests.utils.unquote(link.split("&")[0]) if "uddg=" in u else u
+        out.append(f"- {clean(t)}\n  {link}\n  {clean(sn)}")
+    return "\n".join(out)
+
+
+def t_fetch_url(url: str) -> str:
+    """Скачать веб-страницу и вернуть читаемый текст (без скриптов и тегов)."""
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        html = r.text
+    except Exception as e:
+        return f"ошибка загрузки: {e}"
+    html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    text = re.sub(r"&[a-z#0-9]+;", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:8000] or "(пустая страница)"
+
+
+def t_download_file(url: str, path: str) -> str:
+    """Скачать файл (фото/документ) по ссылке на диск."""
+    p = pathlib.Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
+        if r.status_code != 200:
+            return f"HTTP {r.status_code}"
+        p.write_bytes(r.content)
+    except Exception as e:
+        return f"ошибка скачивания: {e}"
+    return f"СКАЧАНО: {path} ({len(r.content)} байт)"
+
+
+def t_run_python(code: str) -> str:
+    """Выполнить фрагмент Python и вернуть вывод (для расчётов/обработки данных)."""
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                           text=True, timeout=60)
+    except Exception as e:
+        return f"ошибка запуска: {e}"
+    out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
+    return out[:8000] or "(нет вывода)"
+
+
+def t_open_path(target: str) -> str:
+    """Открыть файл/папку/ссылку в системном приложении по умолчанию."""
+    try:
+        if os.name == "nt":
+            os.startfile(target)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+    except Exception as e:
+        return f"не удалось открыть: {e}"
+    return f"ОТКРЫТО: {target}"
+
+
 TOOLS_IMPL = {
     "read_file": t_read_file, "list_dir": t_list_dir, "search": t_search,
     "write_file": t_write_file, "edit_file": t_edit_file, "run_shell": t_run_shell,
-    "remember": t_remember,
+    "remember": t_remember, "view_image": t_view_image, "search_photos": t_search_photos,
+    "web_search": t_web_search, "fetch_url": t_fetch_url, "download_file": t_download_file,
+    "run_python": t_run_python, "open_path": t_open_path,
 }
 # Безопасные инструменты — доступны и в PLAN MODE, без подтверждения.
-READONLY = {"read_file", "list_dir", "search", "remember"}
-MUTATING = {"write_file", "edit_file", "run_shell"}
+READONLY = {"read_file", "list_dir", "search", "remember",
+            "view_image", "search_photos", "web_search", "fetch_url"}
+MUTATING = {"write_file", "edit_file", "run_shell",
+            "download_file", "run_python", "open_path"}
 
 TOOLS_SCHEMA = [
     {"type": "function", "function": {
@@ -379,6 +561,48 @@ TOOLS_SCHEMA = [
                        "память (доступна во всех будущих разговорах). Только важное, не болтовню.",
         "parameters": {"type": "object", "properties": {
             "fact": {"type": "string"}}, "required": ["fact"]}}},
+    {"type": "function", "function": {
+        "name": "view_image",
+        "description": "ГЛАЗА: посмотреть изображение (локальный файл или http(s)-ссылка) и "
+                       "ответить, что на нём, оценить качество, пригодность и т.п.",
+        "parameters": {"type": "object", "properties": {
+            "source": {"type": "string", "description": "путь к файлу или URL картинки"},
+            "question": {"type": "string", "description": "что именно спросить про картинку"}},
+            "required": ["source"]}}},
+    {"type": "function", "function": {
+        "name": "search_photos",
+        "description": "Найти фото на бесплатном стоке Pexels по запросу — вернёт ссылки на фото "
+                       "(их можно посмотреть через view_image или скачать через download_file).",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}, "count": {"type": "integer"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Поиск в интернете (актуальная информация, новости, факты). Возвращает "
+                       "заголовки, ссылки и сниппеты.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_url",
+        "description": "Открыть веб-страницу по ссылке и вернуть её текст (для чтения статьи/доки).",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"}}, "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "download_file",
+        "description": "Скачать файл (фото, документ) по ссылке на диск пользователя.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"}, "path": {"type": "string"}},
+            "required": ["url", "path"]}}},
+    {"type": "function", "function": {
+        "name": "run_python",
+        "description": "Выполнить фрагмент кода Python и вернуть вывод (расчёты, обработка данных).",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string"}}, "required": ["code"]}}},
+    {"type": "function", "function": {
+        "name": "open_path",
+        "description": "Открыть файл, папку или ссылку в системном приложении по умолчанию.",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string"}}, "required": ["target"]}}},
 ]
 
 
@@ -396,8 +620,9 @@ def confirm(name: str, args: dict, state: dict) -> bool:
     """Подтверждение мутирующих действий вне plan mode."""
     if state["yolo"]:
         return True
-    preview = args.get("command") or f"{args.get('path','')}"
-    print(f"{C['y']}  ⚙ {name}: {preview}{C['x']}")
+    preview = (args.get("command") or args.get("path") or args.get("url")
+               or args.get("target") or args.get("code") or "")
+    print(f"{C['y']}  ⚙ {name}: {str(preview)[:120]}{C['x']}")
     try:
         ans = input(f"{C['y']}  Выполнить? [y/N/a=всегда] {C['x']}").strip().lower()
     except EOFError:
@@ -408,24 +633,33 @@ def confirm(name: str, args: dict, state: dict) -> bool:
     return ans in ("y", "yes", "да", "д")
 
 
-SYSTEM = """Ты — личный ИИ-ассистент, работающий в терминале на ПК пользователя \
-(Windows + WSL/Linux). Общайся по-русски, кратко и по делу. Ты умеешь РЕАЛЬНО \
-работать с компьютером через инструменты: читать и править файлы, искать по коду, \
-выполнять команды shell. Действуй по шагам: сначала собери факты (read_file/list_dir/\
-search), потом меняй. Не выдумывай содержимое файлов — читай их. После выполнения \
-задачи дай короткий итог.
+SYSTEM = """Ты — личный ИИ-ассистент в терминале на ПК пользователя (Windows + WSL/Linux). \
+Общайся по-русски, кратко и по делу. Ты умеешь РЕАЛЬНО работать с компьютером через инструменты.
 
-Если включён PLAN MODE — тебе доступны ТОЛЬКО инструменты чтения. Изучи задачу и \
-выдай понятный план действий по пунктам, НИЧЕГО не меняя и не запуская. Менять будешь \
-после того, как пользователь выйдет из plan mode.
+Думай по шагам: пойми задачу → собери факты нужными инструментами → действуй → ПРОВЕРЬ результат. \
+Не выдумывай содержимое файлов, пути и факты — узнавай их инструментами.
 
-ПАМЯТЬ: если пользователь просит что-то запомнить о себе или сообщает устойчивое \
-предпочтение/факт (имя, проект, как он любит работать) — вызови инструмент remember. \
-Не сохраняй мелочи и разовые реплики. Что ты уже помнишь — придёт в системном сообщении.
+Твои инструменты:
+- Файлы/ПК: read_file, list_dir, search, write_file, edit_file, run_shell, open_path, run_python.
+- ГЛАЗА: view_image — посмотреть картинку (локальный файл ИЛИ ссылка) и описать/оценить.
+- Фото-стоки: search_photos — найти бесплатные фото (Pexels), потом можно посмотреть их view_image \
+или скачать download_file.
+- Интернет: web_search (актуальная инфа, факты, новости) и fetch_url (прочитать страницу).
+- Память: remember — сохранить устойчивый факт о пользователе.
 
-ВЫВОД: пиши простым текстом для терминала, без markdown-разметки — не используй ** для
-выделения, # для заголовков и markdown-таблицы. Списки — обычными строками («1. …», «- …»).
-Код приводи как есть, отдельными строками."""
+ВСЕГДА проверяй свою работу (самоконтроль): создал/изменил файл — перечитай его (read_file); \
+запустил код — посмотри вывод; сделал картинку/скачал — при необходимости глянь view_image. \
+Не говори «готово», пока не убедился. Заметил ошибку — исправь сам.
+
+Если включён PLAN MODE — доступны ТОЛЬКО инструменты чтения. Выдай план по пунктам, ничего не \
+меняя и не запуская. Менять будешь после выхода из plan mode.
+
+ПАМЯТЬ: если пользователь просит запомнить о себе или сообщает устойчивый факт/предпочтение \
+(имя, проект, как любит работать) — вызови remember. Не сохраняй мелочи. Что уже помнишь — придёт \
+в системном сообщении.
+
+ВЫВОД: простой текст для терминала, без markdown (** , #, таблиц). Списки — строками («1. …»). \
+Код — как есть, отдельными строками."""
 
 
 # --------------------------------------------------------------------------- #
@@ -468,8 +702,10 @@ def agent_turn(messages: list[dict], state: dict) -> None:
             elif name in MUTATING and not confirm(name, args, state):
                 result = "Отклонено пользователем."
             else:
-                preview = args.get("command") or args.get("path") or args.get("pattern") or ""
-                print(f"{C['d']}  → {name} {preview}{C['x']}")
+                preview = (args.get("command") or args.get("path") or args.get("pattern")
+                           or args.get("url") or args.get("source") or args.get("query")
+                           or args.get("target") or "")
+                print(f"{C['d']}  → {name} {str(preview)[:100]}{C['x']}")
                 try:
                     result = TOOLS_IMPL[name](**args)
                 except Exception as e:
@@ -482,24 +718,90 @@ def agent_turn(messages: list[dict], state: dict) -> None:
 # --------------------------------------------------------------------------- #
 # REPL
 # --------------------------------------------------------------------------- #
-HELP = f"""{C['b']}Команды:{C['x']}
-  /plan      — включить PLAN MODE (только чтение + план, без изменений)
-  /run       — выключить PLAN MODE (разрешить правки и команды)
-  /yolo      — не спрашивать подтверждение на действия (вкл/выкл)
-  /model     — показать модели и какая отвечает сейчас
-  {C['b']}Память:{C['x']}
-  /remember <текст> — запомнить факт о себе навсегда (на все разговоры)
-  /memory    — показать, что ассистент помнит
-  /forget    — стереть всю память
-  {C['b']}Сессии (разговоры):{C['x']}
-  /sessions  — список прошлых разговоров
-  /resume [№]— продолжить прошлый разговор (без номера — последний)
-  /new       — начать новый разговор
-  /reset     — очистить текущий разговор
-  /help      — это сообщение
-  /exit      — выход
-Просто пиши задачу — ассистент сам почитает файлы, поправит код, выполнит команды.
-Разговоры сохраняются автоматически; память переживает закрытие окна."""
+HELP = f"""{C['b']}Управление — просто набери  /  (откроется меню по цифрам).{C['x']}
+В меню: 1 план-режим · 2 авто-«да» · 3 память · 4 разговоры · 5 модели · 0 выход.
+
+Просто пиши задачу обычными словами — ассистент сам:
+  • читает и правит файлы, выполняет команды;
+  • СМОТРИТ картинки (view_image) — файл или ссылку;
+  • ищет фото на бесплатных стоках (search_photos) и качает их;
+  • ищет в интернете (web_search) и читает страницы (fetch_url);
+  • запускает Python, открывает файлы/папки.
+Скажи «запомни, что…» — сохранит навсегда. Разговоры сохраняются сами.
+
+{C['d']}Быстрые команды (для опытных): /plan /run /yolo /model /remember /memory
+/forget /sessions /resume /new /reset /exit{C['x']}"""
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return ""
+
+
+def show_menu(state: dict, messages: list[dict]) -> str:
+    """Меню по цифрам. Возвращает 'exit' для выхода, иначе ''."""
+    plan = "ВКЛ" if state["plan"] else "выкл"
+    yolo = "ВКЛ" if state["yolo"] else "выкл"
+    print(f"{C['b']}МЕНЮ{C['x']} (цифра — действие; просто текст — задача):")
+    print(f"  1  План-режим: {plan}   (только чтение+план)")
+    print(f"  2  Авто-«да» на действия: {yolo}")
+    print("  3  Память (показать/очистить/добавить)")
+    print("  4  Разговоры (продолжить/новый/очистить)")
+    print("  5  Модели")
+    print("  0  Выход")
+    c = _ask(f"{C['g']}выбор ›{C['x']} ")
+
+    if c == "1":
+        state["plan"] = not state["plan"]
+        print(f"{C['y']}План-режим: {'ВКЛ — только чтение и план' if state['plan'] else 'выкл — действия разрешены'}{C['x']}")
+    elif c == "2":
+        state["yolo"] = not state["yolo"]
+        print(f"Авто-«да»: {'ВКЛ' if state['yolo'] else 'выкл'}")
+    elif c == "3":
+        print("  1 показать   2 очистить   3 добавить факт")
+        s = _ask(f"{C['g']}память ›{C['x']} ")
+        if s == "1":
+            mem = load_memory(); print(mem if mem else "Память пуста.")
+        elif s == "2":
+            if _ask("Стереть всю память? [y/N] ").lower() in ("y", "да", "д"):
+                clear_memory(); print("Память очищена.")
+        elif s == "3":
+            f = _ask("Что запомнить: ")
+            saved = add_memory(f)
+            print(f"{C['g']}Запомнил: {saved}{C['x']}" if saved else "пусто.")
+    elif c == "4":
+        sess = list_sessions()
+        for i, s in enumerate(sess[:15], 1):
+            print(f"  {i}. {s['updated']}  ({s['n']} сообщ.)  {s['title'] or '(без названия)'}")
+        print("  цифра — продолжить разговор · н — новый · о — очистить текущий")
+        s = _ask(f"{C['g']}разговоры ›{C['x']} ")
+        if s.isdigit() and 1 <= int(s) <= len(sess):
+            d = load_session(sess[int(s) - 1]["path"])
+            messages[:] = d.get("messages", [])
+            state["session_id"] = d.get("id", sess[int(s) - 1]["id"])
+            state["session_path"] = sess[int(s) - 1]["path"]
+            state["title"] = d.get("title", "")
+            state["created"] = d.get("created") or _now_human()
+            print(f"{C['g']}Продолжаю: {state['title'] or '(без названия)'} ({len(messages)} сообщ.){C['x']}")
+        elif s in ("н", "n", "новый"):
+            messages.clear()
+            sid2 = _now_id()
+            state.update(session_id=sid2, session_path=SESSIONS_DIR / f"{sid2}.json",
+                         created=_now_human(), title="")
+            print("Новый разговор начат.")
+        elif s in ("о", "o"):
+            messages.clear(); print("Текущий разговор очищен.")
+    elif c == "5":
+        print("Цепочка моделей (авто-переключение при лимите):")
+        for i, (prov, m) in enumerate(CHAIN, 1):
+            star = "  ← сейчас" if m == state["active"] else ""
+            avail = "" if (prov == "ollama" or _provider_key(prov)) else "  (нужен ключ)"
+            print(f"  {i}. {short(m)} [{prov}]{avail}{star}")
+    elif c in ("0", "выход", "exit"):
+        return "exit"
+    return ""
 
 
 def main() -> int:
@@ -512,9 +814,9 @@ def main() -> int:
              "session_path": SESSIONS_DIR / f"{sid}.json"}
     messages: list[dict] = []
 
-    print(f"{C['g']}{C['b']}DeepSeek-V3 ассистент{C['x']} "
-          f"{C['d']}(GitHub Models, бесплатно). /help — команды, /exit — выход.{C['x']}")
-    print(f"{C['d']}Рабочая папка: {pathlib.Path.cwd()}{C['x']}")
+    print(f"{C['g']}{C['b']}DeepSeek ассистент{C['x']} "
+          f"{C['d']}(бесплатно). Набери {C['x']}{C['b']}/{C['x']}{C['d']} — меню. Просто пиши задачу.{C['x']}")
+    print(f"{C['d']}Умею: файлы, команды, интернет, ЗРЕНИЕ (картинки), фото-стоки. Рабочая папка: {pathlib.Path.cwd()}{C['x']}")
     _past = list_sessions()
     if _past:
         print(f"{C['d']}Прошлых разговоров: {len(_past)}. "
@@ -533,7 +835,11 @@ def main() -> int:
             return 0
         if not user:
             continue
-        if user in ("/exit", "/quit"):
+        if user in ("/", "меню", "menu", "?"):
+            if show_menu(state, messages) == "exit":
+                save_session(state, messages); print("пока 👋"); return 0
+            continue
+        if user in ("/exit", "/quit", "выход"):
             save_session(state, messages)
             print("пока 👋")
             return 0
