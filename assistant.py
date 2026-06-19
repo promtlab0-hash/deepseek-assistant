@@ -286,6 +286,17 @@ HELP = f"""{C['b']}Команды:{C['x']}
 
 def main() -> int:
     global TOKEN
+    # Windows-консоль по умолчанию cp1251 — принудительно UTF-8, чтобы эмодзи и
+    # кириллица не роняли вывод.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     TOKEN = load_token()
     state = {"plan": False, "yolo": False, "active": None, "mi": 0}
     messages: list[dict] = []
