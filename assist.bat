@@ -1,10 +1,9 @@
 @echo off
-chcp 65001 >nul
-title DeepSeek ассистент
-REM Запуск ассистента на Windows. Дважды кликни или запусти из терминала.
+title DeepSeek assistant
+REM Launcher for Windows. Double-click or run from a terminal.
 set "PY=py"
 where py >nul 2>nul || set "PY=python"
 "%PY%" "%~dp0assistant.py"
 echo.
-echo --- ассистент закрылся. Нажми любую клавишу, чтобы выйти. ---
+echo --- Assistant closed. Press any key to exit. ---
 pause

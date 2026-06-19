@@ -286,8 +286,16 @@ HELP = f"""{C['b']}Команды:{C['x']}
 
 def main() -> int:
     global TOKEN
-    # Windows-консоль по умолчанию cp1251 — принудительно UTF-8, чтобы эмодзи и
-    # кириллица не роняли вывод.
+    # Windows-консоль по умолчанию cp866/cp1251 — переводим её в UTF-8, чтобы
+    # эмодзи и кириллица не роняли вывод и отображались верно. Делаем это здесь
+    # (а не через chcp в .bat — chcp + кириллица в батнике ломает его разбор).
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
